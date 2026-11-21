@@ -20,6 +20,7 @@ const C = { g: (s) => `\x1b[32m${s}\x1b[0m`, y: (s) => `\x1b[33m${s}\x1b[0m`, r:
 
 let failures = 0
 let warnings = 0
+let quotaNote = null
 
 function check(name, ok, detail, { warnOnly = false } = {}) {
   if (ok) console.log(`  ${C.g("PASS")}  ${name}${detail ? C.d(" — " + detail) : ""}`)
@@ -182,6 +183,7 @@ async function main() {
         check("usage devolvido", !!body?.usage, JSON.stringify(body?.usage ?? null))
       } else {
         const e = body?.error ?? {}
+        const isQuota = e.type === "free_limit"
         const scope = e.scope ?? "unknown"
         const scopeTxt =
           scope === "account"
@@ -189,12 +191,14 @@ async function main() {
             : scope === "ip"
               ? "cota por IP e a rotacao nao entregou endereco novo: reconecte o WARP"
               : "cota free atingida"
-        check("chamada real de chat", false, `HTTP ${res.status} - ${scopeTxt}`)
+        // Cota esgotada e estado da conta, nao defeito do sistema instalado: WARN, nao FAIL.
+        check("chamada real de chat", false, `HTTP ${res.status} - ${scopeTxt}`, { warnOnly: isQuota })
         if (e.retry_after_ms) {
           const h = (e.retry_after_ms / 3600000).toFixed(1)
           check("reset da cota informado pelo provedor", true, `~${h}h (retry_after_ms=${e.retry_after_ms})`, { warnOnly: true })
         }
         check("rotacoes tentadas", true, `${e.rotations ?? 0} | IPs: ${(e.ips_tried ?? []).join(", ") || "?"}`, { warnOnly: true })
+        quotaNote = `COTA FREE ESGOTADA (escopo ${scope})`
       }
     }
 
@@ -213,6 +217,10 @@ async function main() {
   }
 
   console.log()
+  if (quotaNote) {
+    console.log(C.y(`${quotaNote}`))
+    console.log(C.d("  A instalacao esta completa. O que para agora e a cota da conta — espere o reset, troque de conta/modelo ou suba de nivel na escada de modelos.\n"))
+  }
   if (failures === 0 && warnings === 0) console.log(C.g("Tudo verde. O sistema esta pronto para uso.\n"))
   else if (failures === 0) console.log(C.y(`${warnings} aviso(s). O sistema funciona, mas confira os itens acima.\n`))
   else console.log(C.r(`${failures} falha(s) e ${warnings} aviso(s). Aponte o log para o troubleshooting.\n`))

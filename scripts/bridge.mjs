@@ -3,6 +3,7 @@
 // Gateway OpenAI-compatible na frente do `opencode serve`, com rotacao VERIFICADA de IP WARP ao bater cota free.
 // Windows / macOS / Linux · sem dependencia externa (so Node 20+ e curl).
 import { createServer } from "node:http"
+import { createServer as createTcpServer } from "node:net"
 import { spawn, execFile } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs"
@@ -261,6 +262,29 @@ async function performRotation(before, reason) {
   }
   log(`rotacao ok (${reason}): ${before ?? "?"} -> ${result.ip} via ${result.step}`)
   return { ok: true, before, after: result.ip, step: result.step }
+}
+
+// ---------------------------------------------------------------- portas
+function portFree(port) {
+  return new Promise((resolve) => {
+    const srv = createTcpServer()
+    srv.once("error", () => resolve(false))
+    srv.once("listening", () => srv.close(() => resolve(true)))
+    srv.listen(port, "127.0.0.1")
+  })
+}
+
+// A porta do opencode serve e interna e pode estar ocupada por outra instancia (ou pelo
+// opencode serve de outro gateway). Em vez de morrer, o bridge procura a proxima livre.
+async function resolveOpencodePort() {
+  if (await portFree(CFG.opencodePort)) return CFG.opencodePort
+  for (let p = CFG.opencodePort + 1; p < CFG.opencodePort + 100; p++) {
+    if (await portFree(p)) {
+      log(`porta ${CFG.opencodePort} ocupada; o opencode serve usara ${p}`)
+      return p
+    }
+  }
+  throw new Error(`nenhuma porta livre para o opencode serve (${CFG.opencodePort}+)`)
 }
 
 // ---------------------------------------------------------------- opencode serve
@@ -549,6 +573,7 @@ const http = createServer(async (req, res) => {
         burned_ips: state.burned.length,
         uptime_ms: Date.now() - (state.startedAt || Date.now()),
         opencode_bin: OPENCODE_BIN,
+        opencode_port: CFG.opencodePort,
         warp_cli: WARP_CLI,
         default_model: CFG.defaultModel,
         last_error: state.lastError ?? null,
@@ -667,6 +692,11 @@ async function boot() {
     log("ERRO: opencode nao encontrado. Instale com `npm i -g opencode-ai` ou defina OPENCODE_BIN.")
     process.exit(2)
   }
+  if (!(await portFree(CFG.bridgePort))) {
+    log(`ERRO: a porta ${CFG.bridgePort} ja esta em uso. Outro gateway esta rodando? Use outra porta em config.json (bridgePort).`)
+    process.exit(3)
+  }
+  CFG.opencodePort = await resolveOpencodePort()
   if (!WARP_CLI) log("AVISO: warp-cli nao encontrado — rodando sem rotacao de IP.")
 
   proxyActive = WARP_CLI ? await proxyProbe() : false

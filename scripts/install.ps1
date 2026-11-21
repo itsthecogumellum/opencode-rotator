@@ -16,6 +16,7 @@ param(
   [string]$DefaultModel = "opencode/deepseek-v4.1-flash-free",
   [switch]$SkipWarp,
   [switch]$SkipService,
+  [switch]$TakeOver,
   [switch]$Uninstall
 )
 
@@ -26,11 +27,13 @@ $RepoOwner = 'itsthecogumellum'
 $RepoName  = 'opencode-rotator'
 $TaskName  = 'OpenCodeRotator'
 
-$Green = "`e[32m"
-$Yellow = "`e[33m"
-$Red = "`e[31m"
-$Dim = "`e[90m"
-$Reset = "`e[0m"
+# PowerShell 5.1 nao conhece o escape `e; o codigo ANSI e montado na mao.
+$ESC = [char]27
+$Green = "$ESC[32m"
+$Yellow = "$ESC[33m"
+$Red = "$ESC[31m"
+$Dim = "$ESC[90m"
+$Reset = "$ESC[0m"
 
 function Say  ($m) { Write-Host $m }
 function Ok   ($m) { Write-Host ("{0}[OK]{1}    {2}" -f $Green, $Reset, $m) }
@@ -54,6 +57,26 @@ function Resolve-Source {
   return $extracted.FullName
 }
 
+function Test-PortInUse([int]$PortNumber) {
+  try {
+    $conn = Get-NetTCPConnection -State Listen -LocalPort $PortNumber -ErrorAction Stop | Select-Object -First 1
+    return [bool]$conn
+  } catch {
+    return $false
+  }
+}
+
+function Get-PortOwner([int]$PortNumber) {
+  try {
+    $conn = Get-NetTCPConnection -State Listen -LocalPort $PortNumber -ErrorAction Stop | Select-Object -First 1
+    if (-not $conn) { return $null }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ Pid = $conn.OwningProcess; CommandLine = $proc.CommandLine; Name = $proc.Name }
+  } catch {
+    return $null
+  }
+}
+
 $AppDir = Join-Path $env:LOCALAPPDATA 'opencode-rotator'
 
 function Uninstall {
@@ -64,8 +87,9 @@ function Uninstall {
   } catch {
     Warn "tarefa $TaskName nao existia"
   }
+  # Mata apenas as instancias deste pacote (caminho da propria pasta), nunca outros bridges.
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-    Where-Object { $_.CommandLine -like '*bridge.mjs*' } |
+    Where-Object { $_.CommandLine -like "*$AppDir*" -and $_.CommandLine -like '*bridge.mjs*' } |
     ForEach-Object {
       Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
       Ok "processo bridge encerrado (pid $($_.ProcessId))"
@@ -177,6 +201,27 @@ if (-not $warpCli) {
   }
 }
 
+# ---------------------------------------------------------------- portas
+Step "portas"
+$owner = Get-PortOwner $Port
+if ($owner) {
+  if ($TakeOver) {
+    Write-Host ("  {0}porta {1} ocupada por {2} (pid {3}). Assumindo a porta.{4}" -f $Yellow, $Port, $owner.Name, $owner.Pid, $Reset)
+    Stop-Process -Id $owner.Pid -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Ok "porta $Port liberada"
+  } else {
+    Die ("porta {0} ja esta em uso por {1} (pid {2}).`n  Linha de comando: {3}`n  Use -TakeOver para o OpenCode Rotator assumir essa porta, ou -Port <outra porta>." -f $Port, $owner.Name, $owner.Pid, $owner.CommandLine)
+  }
+}
+
+# A porta do opencode serve e interna. Se estiver ocupada, o proprio bridge escolhe a
+# proxima livre em runtime — nao matamos nada aqui para nao derrubar outro opencode.
+$ocOwner = Get-PortOwner $OpenCodePort
+if ($ocOwner) {
+  Warn "porta do opencode serve $OpenCodePort ocupada por $($ocOwner.Name) (pid $($ocOwner.Pid)); o bridge vai usar a proxima livre"
+}
+
 # ---------------------------------------------------------------- 4. arquivos
 Step "4/6 arquivos em $AppDir"
 New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
@@ -212,18 +257,36 @@ Ok "config.json gravado (bridge :$Port, proxy :$ProxyPort)"
 
 # ---------------------------------------------------------------- 6. servico
 Step "6/6 inicializacao automatica"
-$nodeBin = (Get-Command node).Source
-$bridgePath = Join-Path $AppDir 'scripts\bridge.mjs'
 if (-not $SkipService) {
-  $action = New-ScheduledTaskAction -Execute $nodeBin -Argument ('"{0}"' -f $bridgePath) -WorkingDirectory $AppDir
-  $trigger = New-ScheduledTaskTrigger -AtLogOn
-  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Gateway OpenAI-compatible com rotacao automatica de IP (OpenCode Rotator)' -Force | Out-Null
-  Ok "tarefa agendada '$TaskName' criada (sobe com o login)"
+  $nodeBin = (Get-Command node).Source
+  $bridgePath = Join-Path $AppDir 'scripts\bridge.mjs'
+  $registered = $false
+  try {
+    $action = New-ScheduledTaskAction -Execute $nodeBin -Argument ('"{0}"' -f $bridgePath) -WorkingDirectory $AppDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Gateway OpenAI-compatible com rotacao automatica de IP (OpenCode Rotator)' -Force -ErrorAction Stop | Out-Null
+    $registered = $true
+    Ok "tarefa agendada '$TaskName' criada (sobe com o login, reinicia a cada 1 min se morrer)"
+  } catch {
+    Warn "tarefa agendada negada (exige administrador): $($_.Exception.Message)"
+    # Fallback sem admin: atalho na pasta de Inicializar do usuario.
+    $startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+    New-Item -ItemType Directory -Path $startup -Force | Out-Null
+    $cmdFile = Join-Path $startup 'OpenCodeRotator.cmd'
+    $cmdBody = "@echo off`r`ncd /d `"$AppDir`"`r`n`"$nodeBin`" `"$bridgePath`"`r`n"
+    [IO.File]::WriteAllText($cmdFile, $cmdBody, [Text.Encoding]::ASCII)
+    $registered = $true
+    Ok "atalho de inicializacao criado (sem admin): $cmdFile"
+    Write-Host ("  {0}para a tarefa agendada com reinicio automatico, rode o instalador como administrador{1}" -f $Dim, $Reset)
+  }
+} else {
+  $nodeBin = (Get-Command node).Source
+  $bridgePath = Join-Path $AppDir 'scripts\bridge.mjs'
 }
 
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-  Where-Object { $_.CommandLine -like '*bridge.mjs*' } |
+  Where-Object { $_.CommandLine -like "*$AppDir*" -and $_.CommandLine -like '*bridge.mjs*' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 1
 Start-Process -FilePath $nodeBin -ArgumentList ('"{0}"' -f $bridgePath) -WorkingDirectory $AppDir -WindowStyle Hidden
