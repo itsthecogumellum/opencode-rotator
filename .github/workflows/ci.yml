@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Sintaxe dos scripts
+        run: |
+          for f in scripts/*.mjs; do node --check "$f"; done
+      - name: Ficheiros obrigatorios
+        run: |
+          test -f SKILL.md
+          test -f README.md
+          test -f GUIA-COMPLETO.md
+          test -f LICENSE
+          test -f scripts/bridge.mjs
+          test -f scripts/bridgectl.mjs
+          test -f scripts/doctor.mjs
+          test -f scripts/install.ps1
+          test -f scripts/install.sh
+      - name: Frontmatter da skill
+        run: |
+          head -1 SKILL.md | grep -q '^---$'
+          grep -q '^name: opencode-rotator' SKILL.md
+          grep -q '^description:' SKILL.md
+      - name: Shellcheck do instalador
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning scripts/install.sh || true

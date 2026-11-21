@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenCode Rotator - gateway OpenAI-compatible com rotacao automatica de IP
+Documentation=https://github.com/itsthecogumellum/opencode-rotator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/opencode-rotator
+Environment=ROTATOR_HOME=%h/.config/opencode-rotator
+Environment=BRIDGE_PORT=8787
+Environment=OPENCODE_PORT=4097
+Environment=WARP_PROXY=http://127.0.0.1:40000
+ExecStart=/usr/bin/node %h/.config/opencode-rotator/scripts/bridge.mjs
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

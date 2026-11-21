@@ -1,0 +1,41 @@
+{
+  "name": "opencode-rotator",
+  "version": "1.0.0",
+  "description": "Gateway OpenAI-compatible local para o OpenCode com rotacao verificada de IP (Cloudflare WARP) quando a cota free acaba.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "bin": {
+    "opencode-rotator": "scripts/bridgectl.mjs"
+  },
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "doctor:rotate": "node scripts/doctor.mjs --rotate",
+    "start": "node scripts/bridge.mjs",
+    "status": "node scripts/bridgectl.mjs status"
+  },
+  "keywords": [
+    "opencode",
+    "warp",
+    "cloudflare",
+    "rate-limit",
+    "free-limit",
+    "ip-rotation",
+    "openai-compatible",
+    "gateway"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/itsthecogumellum/opencode-rotator.git"
+  },
+  "files": [
+    "scripts",
+    "templates",
+    "references",
+    "prompts",
+    "SKILL.md",
+    "GUIA-COMPLETO.md",
+    "README.md",
+    "LICENSE"
+  ]
+}

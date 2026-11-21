@@ -1,0 +1,12 @@
+{
+  "bridgePort": 8787,
+  "opencodePort": 4097,
+  "proxyUrl": "http://127.0.0.1:40000",
+  "defaultModel": "opencode/deepseek-v4.1-flash-free",
+  "opencodeBin": "",
+  "warpCli": "",
+  "keepSessions": false,
+  "burnTtlMs": 86400000,
+  "rotatePollMs": 1500,
+  "warpTimeoutMs": 60000
+}

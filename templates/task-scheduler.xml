@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Tarefa agendada do OpenCode Rotator (Windows).
+  O install.ps1 cria a tarefa equivalente via Register-ScheduledTask; este XML serve para
+  Whoosh, instalacao manual ou maquinas com GPO.
+  node %LOCALAPPDATA%\opencode-rotator\scripts\bridge.mjs
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>OpenCode Rotator - gateway OpenAI-compatible com rotacao automatica de IP</Description>
+    <URI>\\OpenCodeRotator</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT30S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>node</Command>
+      <Arguments>"%LOCALAPPDATA%\opencode-rotator\scripts\bridge.mjs"</Arguments>
+      <WorkingDirectory>%LOCALAPPDATA%\opencode-rotator</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

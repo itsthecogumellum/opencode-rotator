@@ -1,0 +1,12 @@
+node_modules/
+*.log
+bridge.log
+state.json
+config.json
+.DS_Store
+Thumbs.db
+*.zip
+*.tar.gz
+.idea/
+.vscode/
+*.tmp
