@@ -1,0 +1,12 @@
+# Normaliza tudo em LF: o install.sh roda em Linux/macOS e CRLF quebra o interpretador.
+* text=auto eol=lf
+
+# PowerShell e lote leem bem nos dois, mas CRLF e o padrao nativo do Windows.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Binarios (se algum dia entrar) ficam intactos.
+*.png binary
+*.jpg binary
+*.zip binary
+*.exe binary
