@@ -30,6 +30,15 @@ Todas as mudancas relevantes deste projeto.
 - Endpoints de IP: em algumas redes o `api.ipify.org` nao responde via proxy WARP (curl devolve `000`). O codigo testa `ifconfig.me` primeiro e o `api.ipify.org` como fallback.
 - Leitura do modo e da porta do WARP: `warp-cli mode` e `warp-cli proxy port` sem argumento sao erro de uso; a leitura correta e `warp-cli settings` (`Mode: WarpProxy on port 40000`).
 - O instalador nao re-registra o WARP quando ele ja esta registrado (registrar de novo troca o device e o IP).
+- O instalador nao encerra mais **qualquer** `node` com `bridge.mjs` na linha de comando (matava o bridge de outro projeto). Agora so encerra o que pertence a esta pasta.
+- `Register-ScheduledTask` exige administrador e derrubava o instalador no meio. Agora ha fallback: atalho na pasta de Inicializar do usuario, sem admin.
+- Cores do instalador: o escape ANSI `` `e `` nao existe no PowerShell 5.1 (saida literais). O codigo ANSI e montado com `[char]27`.
+- Porta do `opencode serve` ocupada por outra instancia: o bridge agora escolhe a proxima porta livre em runtime, em vez de morrer com `EADDRINUSE`.
+- Porta do gateway ocupada: o bridge falha com mensagem clara em vez de um erro cru de `listen`.
+- Cota free esgotada e estado da conta, nao defeito da instalacao: o doctor reporta como aviso e o instalador termina com codigo 0.
+
+### Adicionado (pos-correcoes)
+- `-TakeOver`: o instalador encerra o processo que ocupa a porta do gateway e assume, para migrar de um gateway antigo.
 
 ### Notas
 - Medido em 21/11/2026: a cota free do provedor em uso nesta maquina e **por conta/dia** — 4 IPs de saida diferentes deram o mesmo limite, com `retryAfterMs` de ~5,8h. O regime pode mudar; o pacote classifica em vez de assumir.

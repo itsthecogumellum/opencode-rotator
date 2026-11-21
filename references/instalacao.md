@@ -16,18 +16,22 @@ Opcoes:
 
 ```powershell
 .\install.ps1 -Port 8787 -ProxyPort 40000 -SkipWarp -SkipService
+.\install.ps1 -TakeOver -Port 8787
 .\install.ps1 -Uninstall
 ```
 
 | Flag | Efeito |
 |---|---|
 | `-Port` | porta do gateway (padrao 8787) |
-| `-OpenCodePort` | porta do `opencode serve` (padrao 4097) |
+| `-OpenCodePort` | porta preferida do `opencode serve` (padrao 4097; se estiver ocupada o proprio bridge escolhe a proxima livre) |
 | `-ProxyPort` | porta do proxy WARP (padrao 40000) |
 | `-DefaultModel` | modelo padrao do gateway |
 | `-SkipWarp` | nao instala nem configura o WARP (roda sem rotacao) |
 | `-SkipService` | nao registra a inicializacao automatica |
+| `-TakeOver` | assume a porta do gateway mesmo se outro bridge estiver usando (para migrar de um gateway antigo) |
 | `-Uninstall` | remove tudo que este pacote instalou |
+
+Sobre a porta do gateway: se ela estiver ocupada por outro processo, o instalador **para com a mensagem exata** de quem esta usando e o que fazer. Com `-TakeOver`, o OpenCode Rotator encerra o processo que ocupa a porta e assume.
 
 ## Linux / macOS (um comando)
 

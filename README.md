@@ -38,6 +38,14 @@ O instalador checa Node 20+, opencode e Cloudflare WARP; coloca o WARP em modo p
 
 > O WARP muda o IP de saida da sua maquina. O instalador avisa antes.
 
+Se a porta 8787 ja estiver ocupada por outro gateway, o instalador para e diz exatamente quem esta usando. Para migrar de um gateway antigo para este, rode com `-TakeOver`:
+
+```powershell
+iwr https://raw.githubusercontent.com/itsthecogumellum/opencode-rotator/main/scripts/install.ps1 | iex -UseBasicParsing
+# ou, ja com o script baixado:
+.\install.ps1 -TakeOver
+```
+
 ## Provar que funciona
 
 ```bash
