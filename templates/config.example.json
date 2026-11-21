@@ -6,6 +6,12 @@
   "opencodeBin": "",
   "warpCli": "",
   "keepSessions": false,
+  "limitRotationBudget": 2,
+  "netRetries": 3,
+  "proxyFailThreshold": 2,
+  "autoFallbackFree": true,
+  "fallbackModels": [],
+  "maxFallbackModels": 3,
   "burnTtlMs": 86400000,
   "rotatePollMs": 1500,
   "warpTimeoutMs": 60000

@@ -2,6 +2,21 @@
 
 Todas as mudancas relevantes deste projeto.
 
+## [1.1.0] - 2026-11-21
+
+### Adicionado
+- **Auto-recuperacao de `ECONNRESET` e quedas de socket**: `bridge.mjs` agora intercepta erros transitorios de rede (`ECONNRESET`, `socket connection was closed`, `Proxy CONNECT aborted`, `fetch failed`, `EPIPE`, `ETIMEDOUT`) e retenta automaticamente ate 3x (`netRetries`) com backoff progressivo e auto-cura do WARP antes de falhar.
+- **Auto-cura de registro do WARP (`ensureWarpReady`)**: se o WARP perder o registro (`Registration Missing` / `Unable`) ou desconectar, o bridge recria o registro, reaplica `mode proxy` + porta e reconecta sozinho.
+- **Cooldown por conta + fallback automatico de modelos free**: quando um modelo bate cota por conta (`scope=account`), o bridge guarda o cooldown (`accountCooldowns` em `state.json`) para nao desperdiçar rotacoes nas chamadas seguintes e tenta automaticamente outro modelo `*-free` livre (`autoFallbackFree`, `fallbackModels`, `maxFallbackModels`), devolvendo `bridge.model_used` e `bridge.fallback_from`.
+- Novo endpoint `POST /admin/clear-cooldowns` e comando `bridgectl clear-cooldowns`.
+- Endpoint `https://1.1.1.1/cdn-cgi/trace` adicionado como probe primario de exit IP (nativo na borda Cloudflare WARP, mais rapido e estavel).
+
+### Corrigido
+- `exitCache.value` nao era atualizado logo apos uma rotacao: a segunda rotacao queimava o IP antigo de novo e comparava contra o endereco errado. Agora atualiza imediatamente e aguarda 800ms de estabilizacao de socket antes do retry.
+- Watchdog do proxy reiniciava o `opencode serve` numa unica piscada de 8s (gerando `ECONNRESET` em cadeia) e podia rodar no meio de uma rotacao. Agora exige 2 falhas seguidas (`proxyFailThreshold`), tenta auto-cura do WARP antes de desligar o proxy e pausa durante rotacoes (`rotationInProgress`).
+- `proxyProbe` usava `-o NUL` em todos os sistemas (criando arquivo `NUL` no Linux/macOS); corrigido para `NUL` no Windows e `/dev/null` em Unix.
+- `bridgectl stop` no Windows usava filtro de titulo de janela (`WINDOWTITLE eq *bridge*`) que nao casa com processo oculto; corrigido para encerrar exatamente o PID do `opencode-rotator`.
+
 ## [1.0.0] - 2026-11-21
 
 ### Adicionado

@@ -11,6 +11,7 @@ import { homedir, platform } from "node:os"
 import { join } from "node:path"
 
 const IS_WIN = platform() === "win32"
+const DEV_NULL = IS_WIN ? "NUL" : "/dev/null"
 const APP_DIR =
   process.env.ROTATOR_HOME ??
   (IS_WIN
@@ -31,6 +32,16 @@ const DEFAULTS = {
   // 2 basta para provar se a cota e por IP: com 2 enderecos diferentes e o mesmo limite,
   // a cota e por conta e insistir em girar IP so queima saidas.
   limitRotationBudget: 2,
+  // Tentativas automaticas para erros transitorios de socket (ECONNRESET, socket closed, Proxy CONNECT aborted).
+  netRetries: 3,
+  // Falhas consecutivas de probe necessarias antes de declarar o proxy caido (evita matar opencode em piscada).
+  proxyFailThreshold: 2,
+  // Se true, quando um modelo free bate cota por conta, tenta automaticamente outro modelo *-free disponivel.
+  autoFallbackFree: true,
+  // Lista opcional de prioridade para fallback (ex: ["opencode/mimo-v2.6-flash-free"]).
+  fallbackModels: [],
+  // Quantos modelos alternativos tentar antes de devolver 429.
+  maxFallbackModels: 3,
   keepSessions: false,
   authUser: "opencode",
   logFile: join(APP_DIR, "bridge.log"),
@@ -64,6 +75,10 @@ function loadConfig() {
   if (process.env.REQUEST_MAX_MS) cfg.requestMaxMs = Number(process.env.REQUEST_MAX_MS)
   if (process.env.ROTATE_TRIES) cfg.rotateTries = Number(process.env.ROTATE_TRIES)
   if (process.env.LIMIT_ROTATION_BUDGET) cfg.limitRotationBudget = Number(process.env.LIMIT_ROTATION_BUDGET)
+  if (process.env.NET_RETRIES) cfg.netRetries = Number(process.env.NET_RETRIES)
+  if (process.env.PROXY_FAIL_THRESHOLD) cfg.proxyFailThreshold = Number(process.env.PROXY_FAIL_THRESHOLD)
+  if (process.env.AUTO_FALLBACK_FREE === "0") cfg.autoFallbackFree = false
+  if (process.env.AUTO_FALLBACK_FREE === "1") cfg.autoFallbackFree = true
   if (process.env.OPENCODE_BIN) cfg.opencodeBin = process.env.OPENCODE_BIN
   if (process.env.WARP_CLI) cfg.warpCli = process.env.WARP_CLI
   if (process.env.KEEP_SESSIONS === "1") cfg.keepSessions = true
@@ -77,13 +92,16 @@ mkdirSync(APP_DIR, { recursive: true })
 // ---------------------------------------------------------------- estado persistente
 const state = {
   burned: [], // { ip, at, reason }
+  accountCooldowns: {}, // { [modelId]: { until, at, reason } }
   rotations: 0,
+  netRetries: 0,
   lastExitIp: null,
   lastError: null,
   startedAt: Date.now(),
   ...(existsSync(STATE_PATH) ? readJson(STATE_PATH) : {}),
 }
 state.burned = Array.isArray(state.burned) ? state.burned : []
+state.accountCooldowns = state.accountCooldowns && typeof state.accountCooldowns === "object" ? state.accountCooldowns : {}
 
 function saveState() {
   try {
@@ -91,6 +109,32 @@ function saveState() {
   } catch (err) {
     console.error("[rotator] falha ao gravar state:", err.message)
   }
+}
+
+function pruneCooldowns() {
+  const now = Date.now()
+  let changed = false
+  for (const [k, v] of Object.entries(state.accountCooldowns)) {
+    if (!v || !v.until || v.until <= now) {
+      delete state.accountCooldowns[k]
+      changed = true
+    }
+  }
+  if (changed) saveState()
+}
+
+function getModelCooldown(modelId) {
+  pruneCooldowns()
+  const entry = state.accountCooldowns[modelId]
+  if (!entry || entry.until <= Date.now()) return null
+  return entry
+}
+
+function setModelCooldown(modelId, retryAfterMs, reason) {
+  const ttl = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 30 * 60 * 1000
+  state.accountCooldowns[modelId] = { until: Date.now() + ttl, at: Date.now(), reason }
+  saveState()
+  log(`cooldown de conta registrado para ${modelId}: ~${(ttl / 60000).toFixed(0)}min`)
 }
 
 function burnIp(ip, reason) {
@@ -170,24 +214,38 @@ function run(cmd, args, opts = {}) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ---------------------------------------------------------------- WARP
-// Endpoints de IP: ifconfig.me responde pelo proxy WARP; ipify e o fallback
-// (em algumas redes o ipify nao responde via proxy e devolve 000).
-const IP_ENDPOINTS = ["https://ifconfig.me/ip", "https://api.ipify.org"]
+// Endpoints de IP: Cloudflare trace (nativo na borda WARP), ifconfig.me e ipify como fallbacks.
+const IP_ENDPOINTS = [
+  { url: "https://1.1.1.1/cdn-cgi/trace", parse: (s) => (s.match(/^ip=([^\r\n]+)/m)?.[1] || "").trim() },
+  { url: "https://ifconfig.me/ip", parse: (s) => s.trim().split("\n")[0].trim() },
+  { url: "https://api.ipify.org", parse: (s) => s.trim().split("\n")[0].trim() },
+]
+
+function proxyPortNumber() {
+  try {
+    return Number(new URL(CFG.proxyUrl).port) || 40000
+  } catch {
+    return 40000
+  }
+}
 
 async function exitIpViaProxy() {
   if (!CURL) return null
-  for (const url of IP_ENDPOINTS) {
-    const r = await run(CURL, ["-s", "-x", CFG.proxyUrl, "--max-time", "15", url], { timeout: 20000 })
-    const ip = (r.stdout || "").trim().split("\n")[0].trim()
-    if (/^[0-9a-fA-F:.]{3,45}$/.test(ip) && ip !== "null") return ip
+  for (const ep of IP_ENDPOINTS) {
+    const r = await run(CURL, ["-s", "-x", CFG.proxyUrl, "--max-time", "12", ep.url], { timeout: 16000 })
+    const ip = ep.parse(r.stdout || "")
+    if (/^[0-9a-fA-F:.]{3,45}$/.test(ip) && ip !== "null") {
+      proxyFailStreak = 0
+      return ip
+    }
   }
   return null
 }
 
 async function proxyProbe() {
   if (!CURL) return false
-  for (const url of IP_ENDPOINTS) {
-    const r = await run(CURL, ["-s", "-o", "NUL", "-w", "%{http_code}", "-x", CFG.proxyUrl, "--max-time", "8", url], { timeout: 12000 })
+  for (const ep of IP_ENDPOINTS) {
+    const r = await run(CURL, ["-s", "-o", DEV_NULL, "-w", "%{http_code}", "-x", CFG.proxyUrl, "--max-time", "8", ep.url], { timeout: 12000 })
     if (r.stdout.trim() === "200") return true
   }
   return false
@@ -198,8 +256,35 @@ async function warp(args, timeout) {
   return run(WARP_CLI, ["--accept-tos", ...args], { timeout: timeout ?? CFG.warpTimeoutMs })
 }
 
+// Auto-cura do WARP quando o registro some ("Registration Missing") ou o tunel desconecta.
+async function ensureWarpReady() {
+  if (!WARP_CLI) return false
+  const st = await warp(["status"], 15000)
+  const out = `${st.stdout}\n${st.stderr}`
+  if (/Registration Missing|Unable/i.test(out)) {
+    log("WARP sem registro detectado — recriando registro e modo proxy automaticamente")
+    await warp(["registration", "new"], 90000)
+    await sleep(1500)
+    await warp(["mode", "proxy"], 20000)
+    await warp(["proxy", "port", String(proxyPortNumber())], 20000)
+    await warp(["connect"], 30000)
+    await sleep(2500)
+    return true
+  }
+  if (/Disconnected/i.test(out)) {
+    log("WARP desconectado — reconectando em modo proxy")
+    await warp(["mode", "proxy"], 20000)
+    await warp(["proxy", "port", String(proxyPortNumber())], 20000)
+    await warp(["connect"], 30000)
+    await sleep(2000)
+    return true
+  }
+  return false
+}
+
 // Um ciclo de reconnect. Retorna o exit IP se conseguir ler, senao null.
 async function warpReconnect() {
+  await ensureWarpReady()
   await warp(["disconnect"], 30000)
   await sleep(1200)
   await warp(["connect"])
@@ -222,6 +307,8 @@ async function rotationLadder(before, burned) {
     if (step === "reregister" || step === "reregister-wait") {
       await warp(["registration", "new"], 90000)
       await sleep(1500)
+      await warp(["mode", "proxy"], 20000)
+      await warp(["proxy", "port", String(proxyPortNumber())], 20000)
     }
     const ip = await warpReconnect()
     if (!ip) continue
@@ -238,6 +325,7 @@ async function rotationLadder(before, burned) {
   return null
 }
 
+let rotationInProgress = false
 let rotationLock = Promise.resolve()
 function queueRotation(before, reason) {
   const next = rotationLock.then(
@@ -249,19 +337,30 @@ function queueRotation(before, reason) {
 }
 
 async function performRotation(before, reason) {
-  const burned = burnedSet()
-  const result = await rotationLadder(before, burned)
-  state.rotations = (state.rotations || 0) + 1
-  state.lastExitIp = result?.ip ?? state.lastExitIp
-  saveState()
-  if (!result) {
-    state.lastError = `rotacao falhou (${reason}): nenhum exit IP novo`
+  rotationInProgress = true
+  try {
+    const burned = burnedSet()
+    const result = await rotationLadder(before, burned)
+    state.rotations = (state.rotations || 0) + 1
+    if (result?.ip) {
+      state.lastExitIp = result.ip
+      exitCache = { at: Date.now(), value: result.ip }
+      proxyFailStreak = 0
+    }
     saveState()
-    log(`rotacao falhou (${reason})`)
-    return { ok: false, before, after: null }
+    if (!result) {
+      state.lastError = `rotacao falhou (${reason}): nenhum exit IP novo`
+      saveState()
+      log(`rotacao falhou (${reason})`)
+      return { ok: false, before, after: null }
+    }
+    // Pequena pausa para os sockets do tunel estabilizarem antes do retry (evita ECONNRESET imediato).
+    await sleep(800)
+    log(`rotacao ok (${reason}): ${before ?? "?"} -> ${result.ip} via ${result.step}`)
+    return { ok: true, before, after: result.ip, step: result.step }
+  } finally {
+    rotationInProgress = false
   }
-  log(`rotacao ok (${reason}): ${before ?? "?"} -> ${result.ip} via ${result.step}`)
-  return { ok: true, before, after: result.ip, step: result.step }
 }
 
 // ---------------------------------------------------------------- portas
@@ -298,6 +397,7 @@ let oldestActiveAt = 0
 let exitCache = { at: 0, value: null }
 let exitProbeBusy = false
 let proxyTicks = 0
+let proxyFailStreak = 0
 let proxyLastProbe = null
 let modelCache = { at: 0, data: null }
 const base = () => `http://127.0.0.1:${CFG.opencodePort}`
@@ -437,7 +537,7 @@ async function oneTurn({ text, model, signal }) {
   return result
 }
 
-// ---------------------------------------------------------------- deteccao de cota free
+// ---------------------------------------------------------------- deteccao de cota free e erros de rede
 const LIMIT_PATTERNS = [
   /used today'?s free messages/i,
   /daily limit reached/i,
@@ -452,15 +552,96 @@ const LIMIT_PATTERNS = [
 ]
 const isLimit = (blob) => LIMIT_PATTERNS.some((re) => re.test(blob || ""))
 
-async function chatCompletion({ model, messages, signal }) {
-  const text = flattenMessages(messages)
+const TRANSIENT_NET_PATTERNS = [
+  /ECONNRESET/i,
+  /socket connection was closed/i,
+  /Proxy CONNECT aborted/i,
+  /UND_ERR_SOCKET/i,
+  /socket hang up/i,
+  /broken pipe|EPIPE/i,
+  /ECONNREFUSED|ETIMEDOUT|EAI_AGAIN/i,
+  /fetch failed|Unable to connect/i,
+  /connection reset by peer/i,
+]
+const isTransientNet = (blob) => TRANSIENT_NET_PATTERNS.some((re) => re.test(blob || ""))
+
+async function listOpencodeModels() {
+  if (!modelCache.data || Date.now() - modelCache.at > 60000) {
+    const listed = await api("/api/model")
+    const models = (listed.json?.data ?? [])
+      .filter((m) => m.providerID === "opencode")
+      .map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.providerID }))
+    modelCache = { at: Date.now(), data: models }
+  }
+  return modelCache.data
+}
+
+function normalizeModelKey(model) {
+  const ref = modelRef(model)
+  return `${ref.providerID}/${ref.id}`
+}
+
+async function pickFallbackModels(primaryModel) {
+  const primaryKey = normalizeModelKey(primaryModel)
+  const out = []
+  const seen = new Set([primaryKey])
+  const push = (m) => {
+    const k = normalizeModelKey(m)
+    if (seen.has(k) || getModelCooldown(k)) return
+    seen.add(k)
+    out.push(k)
+  }
+  if (Array.isArray(CFG.fallbackModels)) {
+    for (const m of CFG.fallbackModels) push(m)
+  }
+  if (CFG.autoFallbackFree) {
+    try {
+      const models = await listOpencodeModels()
+      for (const m of models) {
+        if (/-free$/i.test(m.id)) push(`opencode/${m.id}`)
+      }
+    } catch {}
+  }
+  return out.slice(0, Math.max(0, CFG.maxFallbackModels ?? 3))
+}
+
+// Retenta automaticamente erros transitorios de socket (ECONNRESET / tunel WARP oscilando).
+async function runTurnWithNetRetry({ text, model, signal }) {
+  const max = Math.max(0, CFG.netRetries ?? 3)
+  let netRetriesUsed = 0
+  let lastErr = null
+  for (let i = 0; i <= max; i++) {
+    if (signal?.aborted) throw signal.reason
+    try {
+      const result = await oneTurn({ text, model, signal })
+      const errBlob = !result.text && result.error ? (typeof result.error === "string" ? result.error : JSON.stringify(result.error)) : ""
+      if (!errBlob || !isTransientNet(errBlob) || i === max) {
+        return { result, netRetriesUsed }
+      }
+      lastErr = errBlob
+    } catch (err) {
+      if (signal?.aborted) throw err
+      if (!isTransientNet(err.message) || i === max) throw err
+      lastErr = err.message
+    }
+    netRetriesUsed++
+    state.netRetries = (state.netRetries || 0) + 1
+    saveState()
+    const wait = [1200, 2500, 4000][Math.min(i, 2)]
+    log(`erro de rede transitorio (tentativa ${i + 1}/${max}): ${String(lastErr).slice(0, 140)} — aguardando ${wait}ms`)
+    if (proxyActive && WARP_CLI && i >= 1) {
+      await ensureWarpReady().catch(() => {})
+    }
+    await sleep(wait)
+  }
+  throw new Error(lastErr || "erro de rede transitorio")
+}
+
+async function tryOneModel({ text, model, signal, allowRotate }) {
   let rotation = { rotations: 0 }
-  let result = await oneTurn({ text, model, signal })
+  let { result, netRetriesUsed } = await runTurnWithNetRetry({ text, model, signal })
   const blob = () => (result.text || "") + " " + JSON.stringify(result.error ?? "")
 
-  // Rotacionar IP so ajuda quando a cota e por IP. Se a cota for por conta, girar IP e
-  // desperdicio: o limite volta identico em cada endereco novo. Por isso o orcamento de
-  // rotacoes e pequeno, e o resultado e CLASSIFICADO (escopo ip / conta) em vez de insistir.
   const triedIps = new Set()
   const burnCurrent = () => {
     const before = exitCache.value
@@ -471,10 +652,10 @@ async function chatCompletion({ model, messages, signal }) {
     return before
   }
 
-  for (let attempt = 0; attempt < CFG.limitRotationBudget && proxyActive && isLimit(blob()); attempt++) {
+  for (let attempt = 0; allowRotate && attempt < CFG.limitRotationBudget && proxyActive && isLimit(blob()); attempt++) {
     if (signal?.aborted) throw signal.reason
     const before = burnCurrent()
-    log(`cota free atingida (rotacao ${attempt + 1}/${CFG.limitRotationBudget}) — queimando IP e trocando saida`)
+    log(`cota free atingida em ${model} (rotacao ${attempt + 1}/${CFG.limitRotationBudget}) — queimando IP e trocando saida`)
     const moved = await queueRotation(before, "free limit")
     rotation = {
       rotations: (rotation.rotations ?? 0) + 1,
@@ -484,45 +665,102 @@ async function chatCompletion({ model, messages, signal }) {
     }
     if (moved.after) triedIps.add(moved.after)
     if (!moved.ok) break
-    result = await oneTurn({ text, model, signal })
+    const next = await runTurnWithNetRetry({ text, model, signal })
+    result = next.result
+    netRetriesUsed += next.netRetriesUsed
   }
 
-  if (!result.text && result.error) {
-    const msg = typeof result.error === "string" ? result.error : JSON.stringify(result.error)
-    if (isLimit(msg)) {
-      const m = msg.match(/retryAfterMs\\?"?\s*:\s*(\d+)/)
-      const err = new Error(msg)
-      err.statusCode = 429
-      err.retryAfterMs = m ? Number(m[1]) : null
-      // Escopo: so um endereco.testado => a rotacao nao entregou IP novo (problema de WARP).
-      // Varios enderecos com o mesmo limite => a cota e por conta, nao por IP.
-      const scope = rotation.rotations === 0 ? "unknown" : triedIps.size > 1 ? "account" : "ip"
-      err.limitScope = scope
-      err.ipsTried = [...triedIps]
-      err.rotations = rotation.rotations ?? 0
-      err.exitIp = rotation.ipAfter ?? exitCache.value
-      const scopeMsg =
-        scope === "account"
-          ? "cota free por conta: IPs diferentes, mesmo limite. Rotacionar nao resolve."
-          : scope === "ip"
-            ? "cota free por IP: a rotacao nao entregou um endereco novo (WARP devolveu o mesmo)."
-            : "cota free atingida; nenhuma rotacao foi tentada."
-      log(`cota free: escopo=${scope} | ${scopeMsg}`)
-      state.lastError = `cota free (escopo ${scope}): ${scopeMsg}`
-      saveState()
-      throw err
-    }
-    throw new Error(msg)
-  }
-  return { text: result.text, tokens: result.tokens, rotation }
+  return { result, rotation, triedIps, netRetriesUsed }
 }
 
-function openaiBody({ text, tokens, rotation }, model) {
+async function chatCompletion({ model, messages, signal }) {
+  const text = flattenMessages(messages)
+  const primaryKey = normalizeModelKey(model)
+  const modelsTried = []
+  let totalNetRetries = 0
+  let lastLimitErr = null
+
+  // Se o modelo pedido ja esta em cooldown de cota por conta e fallback esta ativo, pula direto para um modelo livre.
+  const primaryCooldown = getModelCooldown(primaryKey)
+  const candidates = primaryCooldown
+    ? [...(await pickFallbackModels(primaryKey)), primaryKey]
+    : [primaryKey, ...(await pickFallbackModels(primaryKey))]
+
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const currentModel = candidates[idx]
+    modelsTried.push(currentModel)
+    const isFallback = currentModel !== primaryKey
+    if (isFallback) log(`fallback automatico: ${primaryKey} -> ${currentModel}`)
+
+    // So gira IP no primeiro modelo que ainda nao tem cooldown de conta; se ja provou escopo=account, testa outro modelo sem gastar WARP.
+    const allowRotate = !getModelCooldown(currentModel) && !lastLimitErr
+    const { result, rotation, triedIps, netRetriesUsed } = await tryOneModel({
+      text,
+      model: currentModel,
+      signal,
+      allowRotate,
+    })
+    totalNetRetries += netRetriesUsed
+
+    if (!result.text && result.error) {
+      const msg = typeof result.error === "string" ? result.error : JSON.stringify(result.error)
+      if (isLimit(msg)) {
+        const m = msg.match(/retryAfterMs\\?"?\s*:\s*(\d+)/)
+        const retryAfterMs = m ? Number(m[1]) : null
+        const scope = getModelCooldown(currentModel)
+          ? "account"
+          : rotation.rotations === 0
+            ? (lastLimitErr?.limitScope ?? "unknown")
+            : triedIps.size > 1
+              ? "account"
+              : "ip"
+        if (scope === "account") setModelCooldown(currentModel, retryAfterMs, "free limit (account)")
+        const err = new Error(msg)
+        err.statusCode = 429
+        err.retryAfterMs = retryAfterMs
+        err.limitScope = scope
+        err.ipsTried = [...triedIps]
+        err.rotations = rotation.rotations ?? 0
+        err.exitIp = rotation.ipAfter ?? exitCache.value
+        err.modelsTried = [...modelsTried]
+        lastLimitErr = err
+
+        // Se escopo e por conta e ainda ha modelos alternativos livres, tenta o proximo.
+        if (scope === "account" && idx < candidates.length - 1) continue
+
+        const scopeMsg =
+          scope === "account"
+            ? "cota free por conta: IPs diferentes, mesmo limite. Rotacionar nao resolve."
+            : scope === "ip"
+              ? "cota free por IP: a rotacao nao entregou um endereco novo (WARP devolveu o mesmo)."
+              : "cota free atingida; nenhuma rotacao foi tentada."
+        log(`cota free: escopo=${scope} | modelos=${modelsTried.join(",")} | ${scopeMsg}`)
+        state.lastError = `cota free (escopo ${scope}): ${scopeMsg}`
+        saveState()
+        throw err
+      }
+      throw new Error(msg)
+    }
+
+    return {
+      text: result.text,
+      tokens: result.tokens,
+      rotation,
+      modelUsed: currentModel,
+      fallbackFrom: isFallback ? primaryKey : null,
+      netRetriesUsed: totalNetRetries,
+    }
+  }
+
+  throw lastLimitErr || new Error("nenhum modelo disponivel")
+}
+
+function openaiBody({ text, tokens, rotation, modelUsed, fallbackFrom, netRetriesUsed }, model) {
   return {
     id: "chatcmpl-" + randomUUID().replaceAll("-", ""),
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model,
+    model: modelUsed || model,
     choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
     usage: {
       prompt_tokens: tokens?.input ?? 0,
@@ -533,6 +771,9 @@ function openaiBody({ text, tokens, rotation }, model) {
       exit_ip: rotation.ipAfter ?? exitCache.value,
       rotations: rotation.rotations ?? 0,
       rotation_step: rotation.rotationStep ?? null,
+      model_used: modelUsed || model,
+      fallback_from: fallbackFrom ?? null,
+      net_retries: netRetriesUsed ?? 0,
     },
   }
 }
@@ -560,17 +801,21 @@ const http = createServer(async (req, res) => {
 
     if (req.method === "GET" && path === "/healthz") {
       scheduleExitProbe()
+      pruneCooldowns()
       return send(res, 200, {
         ok: !!serverPassword,
         port: CFG.bridgePort,
         proxy: proxyActive,
         exit_ip: exitCache.value,
         proxy_ticks: proxyTicks,
+        proxy_fail_streak: proxyFailStreak,
         proxy_last: proxyLastProbe,
         active: activeRequests,
         active_since: oldestActiveAt || null,
         rotations: state.rotations || 0,
+        net_retries: state.netRetries || 0,
         burned_ips: state.burned.length,
+        active_cooldowns: Object.keys(state.accountCooldowns || {}).length,
         uptime_ms: Date.now() - (state.startedAt || Date.now()),
         opencode_bin: OPENCODE_BIN,
         opencode_port: CFG.opencodePort,
@@ -581,14 +826,8 @@ const http = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && path === "/v1/models") {
-      if (!modelCache.data || Date.now() - modelCache.at > 60000) {
-        const listed = await api("/api/model")
-        const models = (listed.json?.data ?? [])
-          .filter((m) => m.providerID === "opencode")
-          .map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.providerID }))
-        modelCache = { at: Date.now(), data: models }
-      }
-      return send(res, 200, { object: "list", data: modelCache.data })
+      const models = await listOpencodeModels()
+      return send(res, 200, { object: "list", data: models })
     }
 
     if (req.method === "POST" && path === "/admin/rotate") {
@@ -599,7 +838,19 @@ const http = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && path === "/admin/state") {
-      return send(res, 200, { ...state, burned_ips: state.burned.length })
+      pruneCooldowns()
+      return send(res, 200, {
+        ...state,
+        burned_ips: state.burned.length,
+        active_cooldowns: Object.keys(state.accountCooldowns || {}).length,
+      })
+    }
+
+    if (req.method === "POST" && path === "/admin/clear-cooldowns") {
+      state.accountCooldowns = {}
+      saveState()
+      log("cooldowns de conta limpos manualmente")
+      return send(res, 200, { ok: true })
     }
 
     if (req.method === "POST" && path === "/admin/burn") {
@@ -650,6 +901,7 @@ const http = createServer(async (req, res) => {
           retry_after_ms: err.retryAfterMs ?? null,
           rotations: err.rotations ?? 0,
           ips_tried: err.ipsTried ?? [],
+          models_tried: err.modelsTried ?? [],
           exit_ip: err.exitIp ?? exitCache.value,
           hint:
             err.limitScope === "account"
@@ -700,6 +952,10 @@ async function boot() {
   if (!WARP_CLI) log("AVISO: warp-cli nao encontrado — rodando sem rotacao de IP.")
 
   proxyActive = WARP_CLI ? await proxyProbe() : false
+  if (!proxyActive && WARP_CLI) {
+    const healed = await ensureWarpReady().catch(() => false)
+    if (healed) proxyActive = await proxyProbe()
+  }
   if (!proxyActive) log("AVISO: WARP proxy nao responde em " + CFG.proxyUrl + " — opencode direto, rotacao desativada")
 
   await startOpencode(proxyActive)
@@ -711,13 +967,28 @@ async function boot() {
     log(`bridge pronto em http://127.0.0.1:${CFG.bridgePort} (modelo padrao: ${CFG.defaultModel}, proxy: ${proxyActive ? "on" : "off"})`)
   })
 
-  // WARP oscila: quando ele cai ou volta, reinicia o opencode com o env de proxy correto.
+  // WARP oscila: auto-cura antes de derrubar o proxy, com histerese (2 falhas seguidas) e nunca durante rotacao.
   const proxyTimer = setInterval(async () => {
     proxyTicks++
+    if (rotationInProgress) return
     if (activeRequests > 0 && Date.now() - oldestActiveAt < 360000) return
-    const alive = await proxyProbe()
+    let alive = await proxyProbe()
+    if (!alive && WARP_CLI) {
+      const healed = await ensureWarpReady().catch(() => false)
+      if (healed) alive = await proxyProbe()
+    }
     proxyLastProbe = { at: new Date().toISOString(), alive }
-    if (alive === proxyActive) return
+    if (alive) {
+      proxyFailStreak = 0
+      if (proxyActive) return
+    } else {
+      proxyFailStreak++
+      if (!proxyActive) return
+      if (proxyFailStreak < (CFG.proxyFailThreshold ?? 2)) {
+        log(`proxy probe falhou (${proxyFailStreak}/${CFG.proxyFailThreshold ?? 2}) — aguardando proximo ciclo antes de alterar opencode`)
+        return
+      }
+    }
     proxyActive = alive
     log(`proxy ${alive ? "voltou" : "caiu"} — reiniciando opencode ${alive ? "com" : "sem"} proxy`)
     const old = serverChild

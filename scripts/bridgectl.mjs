@@ -72,6 +72,8 @@ async function status() {
   line("modelo padrao", h.default_model)
   line("rotacoes", String(h.rotations ?? 0))
   line("IPs queimados", String(h.burned_ips ?? 0))
+  line("retries de rede", String(h.net_retries ?? 0))
+  line("cooldowns conta", String(h.active_cooldowns ?? 0))
   line("chamadas ativas", String(h.active ?? 0))
   line("uptime", `${Math.round((h.uptime_ms ?? 0) / 1000)}s`)
   if (h.last_error) line("ultimo erro", C.y(h.last_error))
@@ -117,7 +119,9 @@ async function test(text) {
   }
   const b = r.json
   console.log(C.g("resposta: ") + (b.choices?.[0]?.message?.content ?? "").trim())
-  console.log(C.d(`tokens: ${JSON.stringify(b.usage)} · exit_ip: ${b.bridge?.exit_ip} · rotacoes: ${b.bridge?.rotations}`))
+  const fb = b.bridge?.fallback_from ? ` · fallback: ${b.bridge.fallback_from} -> ${b.bridge.model_used}` : ""
+  const nr = b.bridge?.net_retries ? ` · net_retries: ${b.bridge.net_retries}` : ""
+  console.log(C.d(`tokens: ${JSON.stringify(b.usage)} · exit_ip: ${b.bridge?.exit_ip} · rotacoes: ${b.bridge?.rotations}${fb}${nr}`))
 }
 
 async function models() {
@@ -150,13 +154,28 @@ function start() {
   console.log(C.g(`bridge iniciado (pid ${child.pid}). Logs: ${LOG_PATH}`))
 }
 
+async function clearCooldowns() {
+  const r = await j("/admin/clear-cooldowns", { method: "POST", body: "{}" })
+  if (r.status !== 200) fatal(`HTTP ${r.status}: ${r.text}`)
+  console.log(C.g("Cooldowns de conta limpos."))
+}
+
 function stop() {
-  const r = spawn("taskkill", ["/F", "/IM", "node.exe", "/FI", `WINDOWTITLE eq *bridge*`], { windowsHide: true })
-  r.on("exit", () => {})
-  if (!IS_WIN) {
-    spawn("pkill", ["-f", "bridge.mjs"], { detached: false })
-  }
-  console.log(C.y("Se o bridge nao parou: feche o processo node que roda scripts/bridge.mjs (ou a tarefa agendada OpenCodeRotator)."))
+  return new Promise((resolve) => {
+    if (IS_WIN) {
+      const ps = `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -like '*opencode-rotator*bridge.mjs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output ("parado pid " + $_.ProcessId) }`
+      const r = spawn("powershell.exe", ["-NoProfile", "-Command", ps], { stdio: "inherit", windowsHide: true })
+      r.on("exit", () => resolve())
+      r.on("error", () => resolve())
+    } else {
+      const r = spawn("pkill", ["-f", "opencode-rotator.*bridge\\.mjs"], { detached: false })
+      r.on("exit", () => {
+        console.log(C.g("Sinal de parada enviado ao bridge."))
+        resolve()
+      })
+      r.on("error", () => resolve())
+    }
+  })
 }
 
 const table = {
@@ -165,6 +184,7 @@ const table = {
   test: () => test(positional[0]),
   models: () => models(),
   state: () => state(),
+  "clear-cooldowns": () => clearCooldowns(),
   logs: () => logs(positional[0]),
   start: () => start(),
   stop: () => stop(),
@@ -173,15 +193,16 @@ const table = {
 if (!table[cmd]) {
   console.log(`uso: bridgectl <comando>
 
-  status              situacao do bridge, proxy, exit IP e rotacoes
+  status              situacao do bridge, proxy, exit IP, retries e cooldowns
   rotate [--reason X] rotaciona o IP agora (escada completa, com verificacao)
   test [texto]        chamada real de chat (prova que o caminho inteiro funciona)
   models              lista de modelos expostos
-  state               estado persistido (IPs queimados, rotacoes, ultimo erro)
+  state               estado persistido (IPs queimados, cooldowns, rotacoes)
+  clear-cooldowns     limpa cooldowns de cota por conta (ex: apos trocar de conta)
   logs [N]            ultimas N linhas do log
   start | stop        sobe/derruba o bridge em background
 `)
   process.exit(0)
 }
 
-table[cmd]().catch((err) => fatal(err.message))
+Promise.resolve(table[cmd]()).catch((err) => fatal(err.message))

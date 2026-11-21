@@ -17,7 +17,8 @@ O OpenCode Rotator faz a parte chata por voce, com prova:
 - **escada de recuperacao** — `reconnect` → `registration new` → re-registro com espera maior;
 - **IP queimado** — o endereco que estourou a cota fica fora da lista por 24h, entao o sistema nao volta para ele;
 - **auto-recuperacao** — o gateway detecta o limite, rotaciona e repete a chamada sozinho;
-- **classificacao de escopo** — depois de 2 rotacoes em IPs diferentes, se o limite persiste, o pacote diz que a cota e **por conta** e para de girar IP;
+- **anti-`ECONNRESET` + auto-cura do WARP** — retenta quedas transitorias de socket (`ECONNRESET`, `Proxy CONNECT aborted`) e recria registro do WARP se sumir;
+- **classificacao de escopo + fallback free** — depois de 2 rotacoes em IPs diferentes, se o limite persiste, marca cooldown por conta (`scope=account`), para de girar IP e tenta automaticamente outro modelo `*-free` livre;
 - **doctor** — um comando que prova o sistema inteiro, incluindo que o IP mudou.
 
 ## Instalar em um comando
@@ -109,9 +110,10 @@ Resposta traz `usage` e um bloco `bridge` com `exit_ip` e `rotations` — o `exi
 ## Operar
 
 ```bash
-node scripts/bridgectl.mjs status              # bridge, proxy, exit IP, rotacoes, IPs queimados
+node scripts/bridgectl.mjs status              # bridge, proxy, exit IP, rotacoes, retries, cooldowns
 node scripts/bridgectl.mjs rotate              # rotacao manual verificada
 node scripts/bridgectl.mjs test "responda ok"  # chamada real
+node scripts/bridgectl.mjs clear-cooldowns     # limpa cooldowns de cota por conta
 node scripts/bridgectl.mjs logs 100            # ultimas linhas
 node scripts/doctor.mjs                        # diagnostico completo
 ```

@@ -54,6 +54,23 @@ warp-cli --accept-tos connect
 
 Depois reinicie o bridge (o `opencode serve` precisa nascer com o env novo).
 
+## "ECONNRESET: The socket connection was closed unexpectedly"
+
+Acontece quando o tunel do WARP oscila, perde o registro (`Registration Missing`), ou quando um socket keep-alive fica obsoleto logo apos reconectar o proxy.
+
+A partir da **v1.1.0**, o bridge trata isso sozinho:
+1. Retenta automaticamente erros transitorios de socket (`ECONNRESET`, `socket connection was closed`, `Proxy CONNECT aborted`, `fetch failed`) ate `netRetries` vezes (padrao `3`) com backoff progressivo.
+2. Verifica o status do WARP e executa auto-cura (`registration new` + `mode proxy` + `connect`) se o registro sumiu.
+3. Usa histerese de 2 falhas consecutivas no watchdog do proxy para nao derrubar o `opencode serve` numa piscada isolada.
+
+Se o `ECONNRESET` ainda aparecer depois de 3 tentativas, confira o log e o status do WARP:
+
+```bash
+node scripts/bridgectl.mjs status
+node scripts/bridgectl.mjs logs 40
+warp-cli --accept-tos status
+```
+
 ## "a cota estourou e o chat travou sem resposta"
 
 O bridge detecta o limite e rotaciona sozinho (até `ROTATE_TRIES`). Se o chat travou de vez, o limite nao veio do texto — confira se o padrao bateu:
